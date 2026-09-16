@@ -17,7 +17,7 @@ REPO = Path(__file__).parent
 DB_FILE = Path(os.environ.get("DB_FILE") or REPO / "settlements.db")
 AVATAR_FILE = REPO / "gavel.png"
 WEBHOOK_NAME = "Class Action Alert"
-PROJECT_URL = "https://github.com/zeusec/rss-class-actions"
+PROJECT_URL = "https://github.com/zeusec/scrape-class-actions"
 PROJECT_LABEL = "GitHub"
 ATTRIBUTION = (f"[ClassAction]({settlements.CAORG_URL})"
                f" • [Sparrow]({settlements.SPARROW_URL})"

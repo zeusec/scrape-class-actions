@@ -1,4 +1,4 @@
-# rss-class-actions
+# scrape-class-actions
 
 Scrapes class-action settlements once a day and posts new ones to a Discord webhook. Each post has the estimated payout, the claim deadline, whether you need proof, and a link to file directly with the settlement administrator.
 

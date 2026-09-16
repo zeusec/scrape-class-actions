@@ -1,9 +1,9 @@
 .env
 data/
-seen.db
-seen.db-journal
-seen.db-wal
-seen.db-shm
+settlements.db
+settlements.db-journal
+settlements.db-wal
+settlements.db-shm
 .venv/
 __pycache__/
 *.pyc

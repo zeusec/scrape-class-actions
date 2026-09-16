@@ -1,66 +1,52 @@
 #!/usr/bin/env python3
 import os
-import re
 import sys
 import time
-import yaml
-import html
-import signal
+import json
 import base64
+import signal
 import sqlite3
 import logging
 import requests
-import feedparser
+import settlements
 from pathlib import Path
 from dotenv import load_dotenv
-from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 
 REPO = Path(__file__).parent
-FEEDS_FILE = REPO / "feeds.yaml"
-DB_FILE = Path(os.environ.get("DB_FILE") or REPO / "seen.db")
+DB_FILE = Path(os.environ.get("DB_FILE") or REPO / "settlements.db")
 AVATAR_FILE = REPO / "gavel.png"
 WEBHOOK_NAME = "Class Action Alert"
-DEFAULT_POLL_INTERVAL_MINUTES = 15
+PROJECT_URL = "https://github.com/zeusec/rss-class-actions"
+PROJECT_LABEL = "GitHub"
+ATTRIBUTION = (f"[ClassAction]({settlements.CAORG_URL})"
+               f" • [Sparrow]({settlements.SPARROW_URL})"
+               f" • [{PROJECT_LABEL}]({PROJECT_URL})")
+DEFAULT_SCAN_AT = "12:00"
+EMBED_COLOR = 0x0F9129
 HTTP_TIMEOUT = 30
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.3"
-EPOCH = time.struct_time((1970, 1, 1, 0, 0, 0, 0, 1, 0))
+FAR_FUTURE = "9999-12-31"
 
-log = logging.getLogger("rss-class-actions")
+log = logging.getLogger("class-action-settlements")
 _running = True
+_dry_run = False
 
 def _stop(*_):
     global _running
     _running = False
 
-def strip_html(s):
-    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", s or ""))).strip()
-
-def guid(entry):
-    return getattr(entry, "id", None) or getattr(entry, "link", None)
-
-def ts(entry):
-    return getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
-
 def open_db():
     conn = sqlite3.connect(DB_FILE)
-    conn.execute("CREATE TABLE IF NOT EXISTS seen (feed_url TEXT, guid TEXT, posted_at INTEGER, PRIMARY KEY (feed_url, guid))")
+    conn.execute("CREATE TABLE IF NOT EXISTS seen (guid TEXT PRIMARY KEY, posted_at INTEGER)")
     return conn
 
-def mark_seen(conn, url, guids):
+def mark_seen(conn, guids):
     now = int(time.time())
-    conn.executemany("INSERT OR IGNORE INTO seen VALUES (?, ?, ?)", [(url, g, now) for g in guids])
+    conn.executemany("INSERT OR IGNORE INTO seen VALUES (?, ?)", [(g, now) for g in guids])
 
-def fetch_feed(url):
-    try:
-        r = requests.get(url, timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
-        r.raise_for_status()
-    except requests.RequestException as e:
-        return None, str(e)
-    parsed = feedparser.parse(r.content)
-    if parsed.bozo and not parsed.entries:
-        return None, str(parsed.bozo_exception)
-    return parsed, None
+def sort_key(item):
+    deadline = settlements.parse_deadline(item[1]["deadline"])
+    return (deadline.isoformat() if deadline else FAR_FUTURE, item[1]["name"])
 
 def set_webhook_identity(webhook):
     avatar = base64.b64encode(AVATAR_FILE.read_bytes()).decode()
@@ -72,19 +58,37 @@ def set_webhook_identity(webhook):
     except requests.RequestException as e:
         log.warning("webhook patch failed: %s", e)
 
-def build_embed(feed_name, entry):
-    t = ts(entry)
-    when = datetime(*t[:6], tzinfo=timezone.utc).strftime("%b %d, %H:%MZ") if t else ""
-    footer = f"{when} • github.com/zeusec/rss-class-actions" if when else "github.com/zeusec/rss-class-actions"
+def build_embed(rec):
+    claim = [f"[File directly]({rec['official']})"] if rec["official"] else []
+    if rec["sparrow"]:
+        claim.append(f"[File via Sparrow]({rec['sparrow']})")
+    description = " • ".join(claim)
+    if rec["summary"]:
+        description = f"{rec['summary'][:300]}\n\n{description}"
     return {
-        "author": {"name": feed_name[:256]},
-        "title": (getattr(entry, "title", None) or "(no title)")[:256],
-        "url": getattr(entry, "link", None),
-        "description": strip_html(getattr(entry, "summary", ""))[:300],
-        "footer": {"text": footer},
+        "author": {"name": "New Class Action Settlement"},
+        "title": rec["name"][:256],
+        "url": rec["official"],
+        "description": description[:2048],
+        "color": EMBED_COLOR,
+        "fields": [
+            {"name": "Estimated payout", "value": rec["payout"] or "Varies", "inline": True},
+            {"name": "Deadline", "value": rec["deadline"] or "Varies", "inline": True},
+            {"name": "Proof required", "value": rec["proof"] or "Unknown", "inline": True},
+            {"name": "​", "value": ATTRIBUTION, "inline": False},
+        ],
     }
 
+def header_float(headers, name, default):
+    try:
+        return float(headers.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
 def post_to_discord(webhook, embed):
+    if _dry_run:
+        log.info("DRY RUN would post: %s", json.dumps(embed, indent=2))
+        return True
     while _running:
         try:
             r = requests.post(webhook, json={"embeds": [embed]}, timeout=HTTP_TIMEOUT)
@@ -92,74 +96,88 @@ def post_to_discord(webhook, embed):
             log.warning("discord post failed: %s", e)
             return False
         if r.status_code == 429:
-            time.sleep(float(r.headers.get("Retry-After", "1")))
+            time.sleep(header_float(r.headers, "Retry-After", 1))
             continue
         if r.status_code >= 400:
             log.warning("discord %d: %s", r.status_code, r.text[:200])
             return False
-        if int(r.headers.get("X-RateLimit-Remaining", "1")) <= 0:
-            time.sleep(float(r.headers.get("X-RateLimit-Reset-After", "0")))
+        if header_float(r.headers, "X-RateLimit-Remaining", 1) <= 0:
+            time.sleep(header_float(r.headers, "X-RateLimit-Reset-After", 0))
         return True
     return False
 
-def poll_once(conn, feeds, webhook, backlog):
-    t0 = time.monotonic()
-    with ThreadPoolExecutor(max_workers=max(1, len(feeds))) as ex:
-        fetched = list(ex.map(lambda f: (f, fetch_feed(f["url"])), feeds))
-    log.info("fetched %d feeds in %.1fs", len(fetched), time.monotonic() - t0)
-    seeded, pool = [], []
-    for feed, (parsed, err) in fetched:
-        if err:
-            log.warning("%s: %s", feed["name"], err)
-            continue
-        url = feed["url"]
-        visible = [(ts(e) or EPOCH, e, guid(e)) for e in parsed.entries if guid(e)]
-        if not visible:
-            continue
-        untracked = conn.execute("SELECT 1 FROM seen WHERE feed_url=? LIMIT 1", (url,)).fetchone() is None
-        if untracked:
-            mark_seen(conn, url, [g for _, _, g in visible])
-            seeded.append(feed["name"])
-        if backlog > 0:
-            pool.extend((t, feed, e, g) for t, e, g in visible)
-        elif not untracked:
-            existing = {row[0] for row in conn.execute("SELECT guid FROM seen WHERE feed_url=?", (url,))}
-            pool.extend((t, feed, e, g) for t, e, g in visible if g not in existing)
-    conn.commit()
-    if seeded:
-        log.info("first-encounter seeded %d feeds", len(seeded))
-    pool.sort(key=lambda c: c[0], reverse=True)
-    to_post = pool[:backlog] if backlog > 0 else pool
+def post_all(conn, webhook, records):
     posted = 0
-    for _, feed, entry, g in reversed(to_post):
+    for key, rec in records:
         if not _running:
             break
-        if post_to_discord(webhook, build_embed(feed["name"], entry)):
-            mark_seen(conn, feed["url"], [g])
+        if post_to_discord(webhook, build_embed(rec)):
+            mark_seen(conn, [key])
+            conn.commit()
             posted += 1
-    conn.commit()
-    log.info("posted %d (seeded=%d, backlog=%d)", posted, len(seeded), backlog)
+    return posted
+
+def replay(conn, webhook, merged, days):
+    cutoff = int(time.time()) - days * 86400
+    seen_at = dict(conn.execute("SELECT guid, posted_at FROM seen WHERE posted_at >= ?", (cutoff,)))
+    window = [(k, merged[k]) for k in seen_at if k in merged]
+    window.sort(key=lambda item: (seen_at[item[0]], sort_key(item)))
+    log.info("replay: %d settlements first seen in the last %d day(s)", len(window), days)
+    post_all(conn, webhook, window)
+
+def scan(conn, webhook, merged, complete):
+    if conn.execute("SELECT 1 FROM seen LIMIT 1").fetchone() is None:
+        if not complete:
+            log.warning("not seeding: a source failed, and a partial seed would flood "
+                        "the channel with everything it missed once it recovers")
+            return
+        mark_seen(conn, list(merged))
+        conn.commit()
+        log.info("first-encounter seeded %d settlements, posted 0", len(merged))
+        return
+    existing = {row[0] for row in conn.execute("SELECT guid FROM seen")}
+    new = sorted(((k, r) for k, r in merged.items() if k not in existing), key=sort_key)
+    posted = post_all(conn, webhook, new)
+    log.info("posted %d of %d new settlements", posted, len(new))
+
+def seconds_until(scan_at):
+    hour, minute = (int(part) for part in scan_at.split(":"))
+    now = datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
 
 def main():
+    global _dry_run
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     load_dotenv(REPO / ".env")
-    webhook = os.environ.get("DISCORD_WEBHOOK_URL") or sys.exit("DISCORD_WEBHOOK_URL not set")
-    backlog = int(os.environ.get("BACKLOG") or 0)
-    poll_interval_minutes = int(os.environ.get("POLL_INTERVAL") or DEFAULT_POLL_INTERVAL_MINUTES)
-    if poll_interval_minutes < 1:
-        sys.exit("POLL_INTERVAL must be >= 1 minute")
-    poll_interval_seconds = poll_interval_minutes * 60
+    webhook = os.environ.get("DISCORD_WEBHOOK_URL")
+    _dry_run = "--dry-run" in sys.argv or not webhook
+    scan_at = os.environ.get("SCAN_AT") or DEFAULT_SCAN_AT
+    try:
+        seconds_until(scan_at)
+    except ValueError:
+        sys.exit(f"SCAN_AT must be HH:MM in 24-hour time, got {scan_at!r}")
+    lookback_raw = os.environ.get("LOOKBACK_DAYS") or "0"
+    if not lookback_raw.isdigit():
+        sys.exit(f"LOOKBACK_DAYS must be a whole number of days, got {lookback_raw!r}")
+    lookback_days = int(lookback_raw)
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    with open(FEEDS_FILE) as f:
-        feeds = yaml.safe_load(f) or []
     conn = open_db()
-    set_webhook_identity(webhook)
-    log.info("starting: %d feeds, backlog=%d, poll_interval=%dm", len(feeds), backlog, poll_interval_minutes)
+    if not _dry_run:
+        set_webhook_identity(webhook)
+    log.info("starting: db=%s, scan_at=%s, lookback_days=%d%s", DB_FILE, scan_at, lookback_days,
+             ", DRY RUN (no webhook set)" if not webhook else ", DRY RUN" if _dry_run else "")
     while _running:
-        poll_once(conn, feeds, webhook, backlog)
-        backlog = 0
-        for _ in range(poll_interval_seconds):
+        merged, complete = settlements.collect()
+        if merged:
+            scan(conn, webhook, merged, complete)
+            if lookback_days:
+                replay(conn, webhook, merged, lookback_days)
+                lookback_days = 0
+        for _ in range(int(seconds_until(scan_at))):
             if not _running:
                 break
             time.sleep(1)

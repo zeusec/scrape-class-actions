@@ -1,12 +1,13 @@
 services:
-  rss-class-actions:
+  class-action-settlements:
     build: .
-    image: rss-class-actions
-    container_name: rss-class-actions
+    image: class-action-settlements
+    container_name: class-action-settlements
     restart: unless-stopped
     environment:
       DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL}
-      BACKLOG: ${BACKLOG:-0}
-      POLL_INTERVAL: ${POLL_INTERVAL:-15}
+      SCAN_AT: ${SCAN_AT:-12:00}
+      LOOKBACK_DAYS: ${LOOKBACK_DAYS:-0}
+      TZ: ${TZ:-UTC}
     volumes:
       - ./data:/data

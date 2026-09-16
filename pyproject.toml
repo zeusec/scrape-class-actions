@@ -3,8 +3,6 @@ name = "rss-class-actions"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "feedparser>=6.0.12",
     "python-dotenv>=1.2.2",
-    "pyyaml>=6.0.3",
     "requests>=2.34.2",
 ]
